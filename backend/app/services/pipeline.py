@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from app.store import store
+from app.services import aggregation_slice
 
 
 def _now_iso() -> str:
@@ -409,46 +410,41 @@ class IngestPipeline:
         metric_field: str,
         agg_func: str = "count",
     ) -> dict[str, Any]:
-        """基于标准化明细刷新聚合视图。"""
+        """基于标准化明细刷新聚合视图。
+
+        取数边界、字段映射与来源核实统一委托给可追溯聚合切片模块；
+        聚合视图行沿用每次刷新追加一行的历史写法，公开字段与 results
+        内容保持不变，额外挂载切片版本依据。
+        """
         parsed = store.rows("parsed_entity")
-        results: dict[str, dict[str, Any]] = {}
+        # 切片先以「构建中」登记、核实通过后再翻转，交叠刷新期间不影响交付。
+        slice_entry = aggregation_slice.build_slice(
+            view_name, dim_field, metric_field, agg_func
+        )
+        # 深拷贝一份 results，视图行与切片各自持有，避免后续互相污染。
+        results = copy.deepcopy(slice_entry["results"])
 
-        for entity in parsed:
-            if entity.get("status") != "校验通过":
-                continue
-            try:
-                fields_data = json.loads(entity.get("标准化字段集", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-            dim_val = str(fields_data.get(dim_field, "unknown"))
-            metric_val = fields_data.get(metric_field, "0")
-
-            if dim_val not in results:
-                results[dim_val] = {"count": 0, "sum": 0.0, "values": []}
-
-            results[dim_val]["count"] += 1
-            try:
-                results[dim_val]["sum"] += float(metric_val) if metric_val else 0.0
-            except (ValueError, TypeError):
-                pass
-            results[dim_val]["values"].append(metric_val)
-
-        # 创建/更新聚合视图
+        # 创建/更新聚合视图（与历史行为一致：同一视图的每次刷新追加版本行）
         aggs = store.rows("aggregation_view")
         agg_entry = {
             "id": _next_id("aggregation_view"),
             "视图名称": view_name,
             "聚合维度": dim_field,
             "指标定义": f"{agg_func}({metric_field})",
-            "数据源范围": "标准化明细",
+            "数据源范围": aggregation_slice.SOURCE_SCOPE,
             "刷新间隔": "manual",
             "status": "已生效",
             "pending": False,
             "abnormal": False,
             "results": results,
-            "refreshed_at": _now_iso(),
+            "refreshed_at": slice_entry["refreshed_at"],
             "source_records": len(parsed),
+            # 可追溯锚点：该视图行对应一次切片刷新的维度、字段映射与版本。
+            "slice_id": slice_entry["slice_id"],
+            "slice_version": slice_entry["slice_version"],
+            "slice_digest": slice_entry["slice_digest"],
+            "slice_status": slice_entry["status"],
+            "field_mapping": copy.deepcopy(slice_entry["field_mapping"]),
         }
         aggs.append(agg_entry)
 
@@ -457,6 +453,8 @@ class IngestPipeline:
             "message": f"聚合视图 {view_name} 已刷新",
             "view": agg_entry,
             "dimensions": len(results),
+            "slice_id": slice_entry["slice_id"],
+            "slice_version": slice_entry["slice_version"],
         }
 
     # ---------- 阶段6：数据导出 ----------
@@ -465,8 +463,15 @@ class IngestPipeline:
         view_name: str,
         export_format: str = "csv",
         filters: dict[str, str] | None = None,
+        slice_id: str | None = None,
     ) -> dict[str, Any]:
-        """从聚合视图或标准化明细生成导出数据。"""
+        """从聚合视图的可追溯切片生成导出数据。
+
+        交付端不再自行从明细重算，只消费「完整可核实」切片：
+        默认取该视图最新一版已发布切片；传入 ``slice_id`` 时可下载
+        历史版本（含旧字段名映射的统计）。聚合刷新期间出现的「构建中」
+        切片会被跳过，保证交叠刷新时交付来源始终可核实。
+        """
         exports = store.rows("data_export")
         lineages = store.rows("data_lineage")
 
@@ -477,8 +482,27 @@ class IngestPipeline:
             if a.get("视图名称") == view_name:
                 view = a
                 break
+        if view is None:
+            return {"ok": False, "message": f"聚合视图 {view_name} 不存在，无可交付切片"}
 
-        results_data = view.get("results", {}) if view else {}
+        # 统一消费入口：只拿完整可核实的切片。
+        if slice_id is not None:
+            target_slice = aggregation_slice.get_slice(slice_id)
+            if target_slice is None or target_slice.get("view_name") != view_name:
+                return {
+                    "ok": False,
+                    "message": f"视图 {view_name} 找不到切片 {slice_id}",
+                }
+        else:
+            target_slice = aggregation_slice.get_latest_ready_slice(view_name)
+        if target_slice is None or target_slice.get("status") != aggregation_slice.STATUS_READY:
+            return {
+                "ok": False,
+                "message": f"视图 {view_name} 暂无完整可核实的聚合切片，拒绝交付",
+            }
+
+        # 与历史写法一致的独立 results 拷贝，文件内容不与切片互相污染。
+        results_data = copy.deepcopy(target_slice["results"])
 
         export_id = _next_id("data_export")
         export_entry = {
@@ -494,10 +518,15 @@ class IngestPipeline:
             "results": results_data,
             "record_count": len(results_data),
             "exported_at": _now_iso(),
+            # 交付结果回写切片版本依据，可精确对应一次聚合刷新。
+            "slice_id": target_slice["slice_id"],
+            "slice_version": target_slice["slice_version"],
+            "slice_digest": target_slice["slice_digest"],
+            "field_mapping": copy.deepcopy(target_slice["field_mapping"]),
         }
         exports.append(export_entry)
 
-        # 记录血缘
+        # 记录血缘：原有字段全部保留，新增切片与字段映射锚点。
         lineage_entry = {
             "id": _next_id("data_lineage"),
             "来源批次": view_name,
@@ -510,6 +539,15 @@ class IngestPipeline:
             "abnormal": False,
             "export_id": str(export_id),
             "export_format": export_format,
+            # 血缘可对应到一次聚合刷新所采用的维度、字段映射与来源。
+            "slice_id": target_slice["slice_id"],
+            "slice_version": target_slice["slice_version"],
+            "slice_digest": target_slice["slice_digest"],
+            "聚合维度": target_slice["dim_field"],
+            "指标定义": target_slice["metric_def"],
+            "field_mapping": copy.deepcopy(target_slice["field_mapping"]),
+            "source_scope": target_slice["source_scope"],
+            "source_refs": copy.deepcopy(target_slice["source_refs"]),
         }
         lineages.append(lineage_entry)
 

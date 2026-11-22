@@ -45,6 +45,7 @@ class ExportPayload(BaseModel):
     view_name: str = Field(..., min_length=1)
     export_format: str = "csv"
     filters: dict[str, str] | None = None
+    slice_id: str | None = None
 
 
 class WatermarkPayload(BaseModel):
@@ -116,7 +117,9 @@ def pipeline_refresh_aggregation(payload: AggregationPayload) -> dict[str, Any]:
 
 @router.post("/export/build")
 def pipeline_build_export(payload: ExportPayload) -> dict[str, Any]:
-    return pipeline.build_export(payload.view_name, payload.export_format, payload.filters)
+    return pipeline.build_export(
+        payload.view_name, payload.export_format, payload.filters, payload.slice_id
+    )
 
 
 @router.post("/watermark/advance")
